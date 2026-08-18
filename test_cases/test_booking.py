@@ -2,6 +2,7 @@
 第一批测试用例：覆盖登录、创建、查询这个最基础的链路
 """
 import requests
+import pytest
 from config.settings import BASE_URL
 
 """
@@ -11,7 +12,7 @@ case1：测试登录接口能正常返回token
 """
 # 工程化pytest.ini中可选[smoke, regression]，用来标记用例类型，方便后续按类型执行
 # 冒烟执行：pytest -m smoke --html=reports/smoke_report.html --self-contained-html
-# @pytest.mark.smoke   
+@pytest.mark.smoke
 def test_auth_returns_token(auth_token):
     assert isinstance(auth_token, str)
     assert len(auth_token) > 0
@@ -20,6 +21,7 @@ def test_auth_returns_token(auth_token):
 case2：测试创建预订接口能正常返回booking_id
 测试创建预订接口：验证返回的数据和我们提交的数据一致
 """
+@pytest.mark.smoke
 def test_create_booking(created_booking):
     booking_id = created_booking["booking_id"]
     payload = created_booking["payload"]
@@ -104,7 +106,6 @@ def test_get_nonexistent_booking_returns_404():
     assert response.status_code == 404
 
 # case8: 同一个逻辑跑三组不同的数据，pytest的参数化功能
-import pytest
 @pytest.mark.parametrize("totalprice,depositpaid", [
     (100, True),
     (0, False),
@@ -125,3 +126,58 @@ def test_create_booking_with_various_prices(totalprice, depositpaid):
     response = requests.post(f"{BASE_URL}/booking", json = payload)
     assert response.status_code == 200, f"创建预订失败：{response.text}"
     assert response.json()["booking"]["totalprice"] == totalprice
+
+# case9:补充边界case（必填字段缺失、错误数据类型）
+# 每一项结构：(case_name, payload, expected_status, check_fn)
+# check_fn 接收response，返回True/False，用来校验响应体里的具体细节
+INVALID_DATA_CASES = [
+    (
+        {"lastname": "Test", "totalprice": 100, "depositpaid": True,
+         "bookingdates": {"checkin": "2026-08-20", "checkout": "2026-08-25"}},
+        500,
+        None
+    ),
+    (
+        {"firstname": "Wang", "lastname": "Test", "totalprice": "一百",
+         "depositpaid": True,
+         "bookingdates": {"checkin": "2026-08-20", "checkout": "2026-08-25"}},
+        200,
+        lambda r: r.json()["booking"]["totalprice"] is None
+    ),
+    (
+        {"firstname": "Wang", "lastname": "Test", "totalprice": 100,
+         "depositpaid": True,
+         "bookingdates": {"checkin": "2026-13-99", "checkout": "2026-08-25"}},
+        200,
+        lambda r: "NaN" in r.json()["booking"]["bookingdates"]["checkin"]
+    ),
+]
+
+# 单独维护一份用例名称列表，跟上面的元组一一对应，避免用索引去猜
+INVALID_DATA_CASE_IDS = [
+    "缺少firstname字段",
+    "totalprice类型错误",
+    "checkin日期格式非法",
+]
+
+@pytest.mark.parametrize(
+    "payload,expected_status,check_fn",
+    INVALID_DATA_CASES,
+    ids=INVALID_DATA_CASE_IDS
+)
+
+@pytest.mark.regression
+def test_create_booking_with_invalid_data(payload, expected_status, check_fn):
+    """
+    已知缺陷记录：接口对不合法输入没有做校验，
+    要么服务端直接报错(500)，要么静默把脏数据写入后仍返回200。
+    """
+    response = requests.post(f"{BASE_URL}/booking", json=payload)
+
+    assert response.status_code == expected_status, (
+        f"预期状态码{expected_status}，实际{response.status_code}，"
+        f"可能是接口行为发生了变化"
+    )
+
+    if check_fn is not None:
+        assert check_fn(response), f"响应体细节校验失败，实际返回：{response.text}"
