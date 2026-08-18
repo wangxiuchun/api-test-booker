@@ -11,6 +11,9 @@ import logging
 import json
 import requests
 from config.settings import BASE_URL
+import os
+
+os.makedirs("reports", exist_ok=True)  # 加在logging.basicConfig之前
 
 # 配置日志：同时写入文件和打印到终端
 logging.basicConfig(
