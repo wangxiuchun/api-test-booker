@@ -1,21 +1,16 @@
 """
 http_client.py
-
-统一封装HTTP请求，替代直接调用requests。
-好处：
-1. 不用每个用例都手写完整URL（BASE_URL在这里统一拼接）
-2. 每次请求自动记录日志，排查失败用例时能看到完整的请求/响应细节
-3. 以后要统一加header、改超时时间，只需要改这一个文件
 """
+import os
 import logging
 import json
 import requests
 from config.settings import BASE_URL
-import os
+from urllib3.util.retry import Retry
+from requests.adapters import HTTPAdapter
 
-os.makedirs("reports", exist_ok=True)  # 加在logging.basicConfig之前
+os.makedirs("reports", exist_ok=True)
 
-# 配置日志：同时写入文件和打印到终端
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(message)s",
@@ -26,9 +21,20 @@ logging.basicConfig(
 )
 logger = logging.getLogger("api_test")
 
+# 用Session复用连接，减少并发场景下重复建立TCP连接对本地网络环境（如VPN）造成的压力
+_session = requests.Session()
+# 配置自动重试：遇到连接失败，最多重试3次，每次间隔递增（避免瞬时冲击）
+_retry_strategy = Retry(
+    total=3,
+    backoff_factor=0.5,  # 重试间隔：0.5秒、1秒、2秒，逐渐拉长
+    status_forcelist=[500, 502, 503, 504],  # 服务端错误也一并重试
+)
+_adapter = HTTPAdapter(pool_connections=10, pool_maxsize=10, max_retries=_retry_strategy)
+_session.mount("https://", _adapter)
+_session.mount("http://", _adapter)
+
 
 def _log_request(method, url, kwargs):
-    """记录请求发出前的完整信息"""
     logger.info(f"→ 请求: {method} {url}")
     if "json" in kwargs:
         logger.info(f"  请求体: {json.dumps(kwargs['json'], ensure_ascii=False)}")
@@ -37,27 +43,20 @@ def _log_request(method, url, kwargs):
 
 
 def _log_response(response):
-    """记录响应返回后的完整信息"""
     logger.info(f"← 响应: {response.status_code}")
-    logger.info(f"  响应体: {response.text[:500]}")  # 只记前500字符，避免日志过长
+    logger.info(f"  响应体: {response.text[:500]}")
 
 
 def _request(method, path, **kwargs):
-    """
-    所有请求的统一入口。
-    path是相对路径（比如"/booking/123"），这里自动拼接BASE_URL，
-    调用方不用再自己写f"{BASE_URL}/booking/123"这种拼接逻辑
-    """
     url = f"{BASE_URL}{path}"
     _log_request(method, url, kwargs)
 
-    response = requests.request(method, url, **kwargs)
+    response = _session.request(method, url, **kwargs)  # 改成用session
 
     _log_response(response)
     return response
 
 
-# 对外暴露的四个方法，业务代码只需要用这几个，不用直接接触requests
 def get(path, **kwargs):
     return _request("GET", path, **kwargs)
 

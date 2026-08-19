@@ -4,6 +4,8 @@
 from utils import http_client
 import pytest
 from config.settings import BASE_URL
+import time
+from concurrent.futures import ThreadPoolExecutor
 
 """
 case1：测试登录接口能正常返回token
@@ -176,3 +178,52 @@ def test_create_booking_with_invalid_data(payload, expected_status, check_fn):
 
     if check_fn is not None:
         assert check_fn(response), f"响应体细节校验失败，实际返回：{response.text}"
+
+# case10: 并发创建预订，测试接口在高并发下的稳定性
+def _create_one_booking():
+    """
+    单次创建请求，返回(耗时秒数, 状态码)
+    抽成独立函数，方便被线程池重复调用
+    """
+    payload = {
+        "firstname": "LoadTest", "lastname": "User",
+        "totalprice": 100, "depositpaid": True,
+        "bookingdates": {"checkin": "2026-08-20", "checkout": "2026-08-25"}
+    }
+    start = time.time()
+    response = http_client.post("/booking", json=payload)
+    elapsed = time.time() - start
+    return elapsed, response.status_code
+
+
+@pytest.mark.regression
+@pytest.mark.parametrize("concurrency", [5, 10, 15])
+def test_concurrent_booking_creation(concurrency):
+    """
+    性能维度：同时发起20个创建请求，观察响应时间和成功率
+    不追求专业压测精度，目的是体现"并发场景下系统表现如何"这个测试维度
+    """
+    # concurrency = 5
+
+    with ThreadPoolExecutor(max_workers=concurrency) as executor:
+        results = list(executor.map(lambda _: _create_one_booking(), range(concurrency)))
+
+    times = [r[0] for r in results]
+    statuses = [r[1] for r in results]
+
+    avg_time = sum(times) / len(times)
+    max_time = max(times)
+    min_time = min(times)
+    success_count = statuses.count(200)
+
+    print(f"\n并发数：{concurrency}")
+    print(f"平均耗时：{avg_time:.2f}秒")
+    print(f"最长耗时：{max_time:.2f}秒")
+    print(f"最短耗时：{min_time:.2f}秒")
+    print(f"成功率：{success_count}/{concurrency}")
+
+    # 宽松断言：只确认绝大多数请求没有失败，不对响应时间做硬性要求
+    # （在线免费Demo系统本身性能不稳定，严格断言容易造成误报）
+    assert success_count >= concurrency * 0.9, (
+        f"并发创建成功率过低：{success_count}/{concurrency}"
+    )

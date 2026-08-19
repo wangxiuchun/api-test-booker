@@ -147,14 +147,15 @@ pytest test_cases/test_booking.py --markers
 
 ## 测试用例说明
 
-| 用例                                                       | 标记         | 覆盖场景                                                                                  |
-| ---------------------------------------------------------- | ------------ | ----------------------------------------------------------------------------------------- |
-| `test_auth_returns_token`                                  | `smoke`      | 验证登录接口能正常返回token                                                               |
-| `test_create_booking`                                      | `smoke`      | 验证创建预订后，数据能被正确查询到                                                        |
-| `test_get_nonexistent_booking_returns_404`                 | `regression` | 边界测试：查询不存在的资源应返回404                                                       |
-| `test_update_without_token_should_fail`                    | `regression` | 鉴权测试：不带token更新，应被拒绝（403）                                                  |
-| `test_delete_without_token_should_fail`                    | `regression` | 鉴权测试：不带token删除，应被拒绝（403）                                                  |
-| `test_create_booking_with_invalid_data`（参数化，3组数据） | `regression` | 已知缺陷记录：缺失字段导致500、非法类型/日期被静默写入脏数据（详见[踩坑记录](#踩坑记录)） |
+| 用例                                                       | 标记         | 覆盖场景                                                                                    |
+| ---------------------------------------------------------- | ------------ | ------------------------------------------------------------------------------------------- |
+| `test_auth_returns_token`                                  | `smoke`      | 验证登录接口能正常返回token                                                                 |
+| `test_create_booking`                                      | `smoke`      | 验证创建预订后，数据能被正确查询到                                                          |
+| `test_get_nonexistent_booking_returns_404`                 | `regression` | 边界测试：查询不存在的资源应返回404                                                         |
+| `test_update_without_token_should_fail`                    | `regression` | 鉴权测试：不带token更新，应被拒绝（403）                                                    |
+| `test_delete_without_token_should_fail`                    | `regression` | 鉴权测试：不带token删除，应被拒绝（403）                                                    |
+| `test_create_booking_with_invalid_data`（参数化，3组数据） | `regression` | 已知缺陷记录：缺失字段导致500、非法类型/日期被静默写入脏数据（详见[踩坑记录](#踩坑记录)）   |
+| `test_concurrent_booking_creation`（参数化，5/10/15并发）  | `regression` | 性能维度：不同并发梯度下的响应时间与成功率，观察响应时间波动性（详见[踩坑记录](#踩坑记录)） |
 
 设计原则：
 
@@ -266,6 +267,52 @@ git ls-files | Select-String pycache
 
 这个坑的通用教训：**不能假设本地手动建过的文件夹，在任何运行环境里都天然存在**——凡是代码依赖某个目录/文件先存在，要么在代码里做防御性创建，要么在部署/CI流程里显式声明，两者选一，最好两者都做。
 
+### 8. 并发测试时VPN环境导致连接被中止，靠"连接池复用+自动重试"解决
+
+给项目加了一个性能维度的用例（`test_concurrent_booking_creation`），用 `ThreadPoolExecutor` 同时发起多个创建预订请求，观察响应时间和成功率。排查过程中遇到的问题和解决路径，完整记录如下：
+
+```
+20并发 + VPN开启 → ConnectionAbortedError(10053)：本地软件中止了已建立的连接
+        ↓
+关闭VPN重试 → ConnectTimeout：连不上Heroku服务器
+        （证实访问 restful-booker.herokuapp.com 必须保持VPN开启）
+        ↓
+降到5并发 + VPN开启 → 仍然是10053
+        （说明不是并发数量的问题，而是VPN处理并发连接本身不稳定）
+        ↓
+给 http_client.py 引入 requests.Session + HTTPAdapter 连接池复用
+        → 单组5并发能稳定通过
+        → 但5/10/15三组连续跑（累计30次请求）又开始失败
+        （说明短时间内的请求总量/频率也会触发同样的问题）
+        ↓
+在 HTTPAdapter 上叠加 urllib3.Retry 自动重试策略
+        （最多重试3次，重试间隔按0.5秒递增，一并覆盖5xx服务端错误）
+        → 5/10/15三组梯度全部稳定通过
+```
+
+**关键结论**：
+
+- 这个问题本质是**本地网络环境（VPN客户端）在处理并发/连续请求时不稳定**，不是被测系统或测试代码的问题
+- **`requests.Session` + 连接池**解决的是"重复建立TCP连接"带来的开销和压力，**`Retry` 自动重试**解决的是"偶发的瞬时连接中断"——两者作用层面不同，需要一起用才能覆盖完整的网络抖动场景，这也是真实项目里应对网络不稳定的标准组合
+- 15并发下观察到的数据：平均耗时0.67秒，但最长1.57秒、最短仅0.23秒，波动幅度接近7倍——**响应时间的波动性会随并发量上升而明显放大**，这比单看平均值更能反映系统在压力下的真实表现
+
+**最终配置**（`utils/http_client.py`）：
+
+```python
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
+
+_session = requests.Session()
+_retry_strategy = Retry(
+    total=3,
+    backoff_factor=0.5,
+    status_forcelist=[500, 502, 503, 504],
+)
+_adapter = HTTPAdapter(pool_connections=10, pool_maxsize=10, max_retries=_retry_strategy)
+_session.mount("https://", _adapter)
+_session.mount("http://", _adapter)
+```
+
 ---
 
 ## 后续计划
@@ -273,5 +320,5 @@ git ls-files | Select-String pycache
 - [x] 补充更多参数化边界case（必填字段缺失、错误数据类型），并发现3个真实接口缺陷
 - [x] 用 `@pytest.mark` 划分冒烟测试/回归测试，支持按标记选择性运行
 - [x] 增加请求日志记录，封装统一HTTP客户端，方便失败时排查具体请求/响应内容
-- [x] CI分层：先跑 `smoke` 快速反馈，通过后再跑 `regression` 完整回归
-- [ ] 尝试性能维度：批量并发创建预订，观察响应时间变化
+- [x] CI分层：`smoke` 冒烟测试通过后才触发 `regression` 完整回归测试
+- [x] 尝试性能维度：批量并发创建预订，观察响应时间变化，并解决了本地VPN环境下的并发连接不稳定问题
